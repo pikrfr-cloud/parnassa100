@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """
-🚀 Market Intelligence Bot — Single File Edition
-==================================================
-Monitors Polymarket, Kalshi, and RSS feeds.
-Sends multilingual alerts (EN/HE/FR) to Telegram.
-
-Usage:
-    python main.py              # Run continuously
-    python main.py --once       # Single scan
+🚀 בוט מודיעין שווקים — גרסה עברית
+=====================================
+מנטר Polymarket, Kalshi ו-RSS feeds.
+שולח התראות בעברית לטלגרם עם ניתוח השפעה על הימורים.
 """
 
 import asyncio
@@ -17,7 +13,7 @@ import os
 import re
 import signal
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Optional
@@ -40,7 +36,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_MINUTES", "120"))
 ALERT_THRESHOLD = int(os.getenv("ALERT_THRESHOLD_BPS", "15"))
-LANGUAGES = os.getenv("LANGUAGES", "en,he,fr").split(",")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 STATE_FILE = os.getenv("STATE_FILE", "/data/bot_state.json")
 
@@ -49,105 +44,17 @@ KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 
 RSS_FEEDS = {
     "central_banks": [
-        {"name": "Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml"},
-        {"name": "ECB", "url": "https://www.ecb.europa.eu/rss/press.html"},
+        {"name": "הפדרל ריזרב", "url": "https://www.federalreserve.gov/feeds/press_all.xml"},
+        {"name": "הבנק האירופי", "url": "https://www.ecb.europa.eu/rss/press.html"},
     ],
     "news": [
         {"name": "CoinDesk", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
         {"name": "Politico", "url": "https://rss.politico.com/politics-news.xml"},
     ],
     "legislation": [
-        {"name": "US Congress", "url": "https://www.govinfo.gov/rss/bills.xml"},
+        {"name": "הקונגרס האמריקאי", "url": "https://www.govinfo.gov/rss/bills.xml"},
     ],
 }
-
-# ═══════════════════════════════════════════════════════════
-# TRANSLATIONS (EN / HE / FR)
-# ═══════════════════════════════════════════════════════════
-
-TRANSLATIONS = {
-    "en": {
-        "bot_started": (
-            "🚀 Market Intelligence Bot Started!\n\n"
-            "🔍 Status: Active\n⏰ Frequency: Every {interval} min\n"
-            "📊 Sources: Polymarket, Kalshi, RSS\n"
-            "🎯 Alert threshold: {threshold}+ bps\n🌐 Languages: EN, HE, FR"
-        ),
-        "gap_title": "🔔 GAP ALERT — {name}",
-        "gap_body": (
-            "📊 Market: {name}\n🏷️ Category: {cat}\n\n"
-            "Polymarket: {poly}%\nKalshi: {kalshi}%\n"
-            "📐 Gap: {gap} bps\n📈 Direction: {dir}\n\n"
-            "🔗 Poly: {poly_url}\n🔗 Kalshi: {kalshi_url}"
-        ),
-        "move_title": "⚡ BIG MOVE — {name}",
-        "move_body": (
-            "📊 {name}\n🏷️ Category: {cat}\nSource: {src}\n\n"
-            "Before: {old}% → Now: {new}%\n📐 Move: {delta} bps\n"
-            "⏱️ Timeframe: {tf}\n\n🔗 {url}"
-        ),
-        "rss_title": "📰 {feed} — New Update",
-        "rss_body": "📌 {title}\n\n{summary}\n\n🔗 {link}",
-        "heartbeat": "💓 Bot alive — {ts}\nMarkets: {mc} | Feeds: {fc}",
-    },
-    "he": {
-        "bot_started": (
-            "🚀 בוט מודיעין שווקים הופעל!\n\n"
-            '🔍 מצב: פעיל\n⏰ תדירות: כל {interval} דקות\n'
-            "📊 מקורות: Polymarket, Kalshi, RSS\n"
-            '🎯 סף התראה: {threshold}+ נ"ב\n🌐 שפות: EN, HE, FR'
-        ),
-        "gap_title": "🔔 התראת פער — {name}",
-        "gap_body": (
-            "📊 שוק: {name}\n🏷️ קטגוריה: {cat}\n\n"
-            "Polymarket: {poly}%\nKalshi: {kalshi}%\n"
-            '📐 פער: {gap} נ"ב\n📈 כיוון: {dir}\n\n'
-            "🔗 Poly: {poly_url}\n🔗 Kalshi: {kalshi_url}"
-        ),
-        "move_title": "⚡ תנועה גדולה — {name}",
-        "move_body": (
-            "📊 {name}\n🏷️ קטגוריה: {cat}\nמקור: {src}\n\n"
-            'לפני: {old}% → עכשיו: {new}%\n📐 תנועה: {delta} נ"ב\n'
-            "⏱️ טווח: {tf}\n\n🔗 {url}"
-        ),
-        "rss_title": "📰 {feed} — עדכון חדש",
-        "rss_body": "📌 {title}\n\n{summary}\n\n🔗 {link}",
-        "heartbeat": "💓 הבוט פעיל — {ts}\nשווקים: {mc} | פידים: {fc}",
-    },
-    "fr": {
-        "bot_started": (
-            "🚀 Bot Intelligence Marchés Activé!\n\n"
-            "🔍 Statut: Actif\n⏰ Fréquence: Toutes les {interval} min\n"
-            "📊 Sources: Polymarket, Kalshi, RSS\n"
-            "🎯 Seuil: {threshold}+ pdb\n🌐 Langues: EN, HE, FR"
-        ),
-        "gap_title": "🔔 ALERTE ÉCART — {name}",
-        "gap_body": (
-            "📊 Marché: {name}\n🏷️ Catégorie: {cat}\n\n"
-            "Polymarket: {poly}%\nKalshi: {kalshi}%\n"
-            "📐 Écart: {gap} pdb\n📈 Direction: {dir}\n\n"
-            "🔗 Poly: {poly_url}\n🔗 Kalshi: {kalshi_url}"
-        ),
-        "move_title": "⚡ MOUVEMENT — {name}",
-        "move_body": (
-            "📊 {name}\n🏷️ Catégorie: {cat}\nSource: {src}\n\n"
-            "Avant: {old}% → Maintenant: {new}%\n📐 Mouvement: {delta} pdb\n"
-            "⏱️ Période: {tf}\n\n🔗 {url}"
-        ),
-        "rss_title": "📰 {feed} — Mise à jour",
-        "rss_body": "📌 {title}\n\n{summary}\n\n🔗 {link}",
-        "heartbeat": "💓 Bot en vie — {ts}\nMarchés: {mc} | Flux: {fc}",
-    },
-}
-
-
-def tr(key, lang="en", **kw):
-    tmpl = TRANSLATIONS.get(lang, TRANSLATIONS["en"]).get(key, key)
-    try:
-        return tmpl.format(**kw)
-    except KeyError:
-        return tmpl
-
 
 # ═══════════════════════════════════════════════════════════
 # LOGGING
@@ -164,7 +71,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 # ═══════════════════════════════════════════════════════════
-# DATA CLASSES
+# CATEGORY & KEYWORD CONFIG
 # ═══════════════════════════════════════════════════════════
 
 CATEGORY_KEYWORDS = {
@@ -176,6 +83,16 @@ CATEGORY_KEYWORDS = {
     "climate": ["hurricane", "earthquake", "temperature", "climate", "wildfire"],
 }
 
+CATEGORY_HEBREW = {
+    "crypto": "קריפטו",
+    "politics": "פוליטיקה",
+    "macro": "מאקרו/ריביות",
+    "sports": "ספורט",
+    "tech": "טכנולוגיה",
+    "climate": "אקלים",
+    "other": "אחר",
+}
+
 RSS_KEYWORDS = [
     "interest rate", "rate decision", "monetary policy", "inflation", "cpi", "gdp",
     "recession", "fed", "ecb", "fomc", "bitcoin", "crypto", "stablecoin",
@@ -183,6 +100,184 @@ RSS_KEYWORDS = [
     "war", "conflict", "ceasefire", "breaking", "urgent", "surprise",
 ]
 
+# ═══════════════════════════════════════════════════════════
+# TRANSLATION DICTIONARY (common market terms EN→HE)
+# ═══════════════════════════════════════════════════════════
+
+TERM_TRANSLATIONS = {
+    # Politics
+    "president": "נשיא", "election": "בחירות", "senate": "סנאט",
+    "congress": "קונגרס", "vote": "הצבעה", "governor": "מושל",
+    "impeach": "הדחה", "democrat": "דמוקרטים", "republican": "רפובליקנים",
+    "white house": "הבית הלבן", "supreme court": "בית המשפט העליון",
+    # Macro
+    "interest rate": "ריבית", "rate cut": "הורדת ריבית", "rate hike": "העלאת ריבית",
+    "inflation": "אינפלציה", "recession": "מיתון", "gdp": "תוצר מקומי גולמי",
+    "unemployment": "אבטלה", "tariff": "מכס", "trade war": "מלחמת סחר",
+    "debt ceiling": "תקרת חוב", "federal reserve": "הפדרל ריזרב",
+    "central bank": "בנק מרכזי", "monetary policy": "מדיניות מוניטרית",
+    # Crypto
+    "bitcoin": "ביטקוין", "ethereum": "אתריום", "crypto": "קריפטו",
+    "stablecoin": "מטבע יציב", "halving": "חצייה", "etf": "תעודת סל",
+    "token": "טוקן", "blockchain": "בלוקצ'יין",
+    # Geopolitics
+    "war": "מלחמה", "ceasefire": "הפסקת אש", "conflict": "סכסוך",
+    "sanction": "סנקציה", "invasion": "פלישה", "missile": "טיל",
+    "nato": "נאט\"ו",
+    # General
+    "yes": "כן", "no": "לא", "will": "האם",
+    "before": "לפני", "after": "אחרי", "by": "עד",
+    "win": "ניצחון", "lose": "הפסד", "above": "מעל", "below": "מתחת",
+}
+
+
+def translate_title(title: str) -> str:
+    """Translate an English market title to Hebrew (keyword-based)."""
+    result = title
+    for en, he in sorted(TERM_TRANSLATIONS.items(), key=lambda x: -len(x[0])):
+        pattern = re.compile(re.escape(en), re.IGNORECASE)
+        result = pattern.sub(he, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+# BETTING IMPACT ANALYSIS
+# ═══════════════════════════════════════════════════════════
+
+# Map event keywords to related betting markets and impact level
+IMPACT_RULES = [
+    # Macro / Central Banks
+    {
+        "triggers": ["rate cut", "rate decision", "interest rate", "fed", "fomc", "monetary policy", "dovish", "hawkish"],
+        "markets": ["שוקי ריביות (Kalshi/Poly)", "אג\"ח ממשלתי", "מט\"ח (דולר)", "מניות צמיחה"],
+        "level": "🔴 גבוהה",
+        "note": "החלטות ריבית משפיעות ישירות על שווקי התחזיות של ריביות, אג\"ח, ודולר",
+    },
+    {
+        "triggers": ["inflation", "cpi", "pce"],
+        "markets": ["שוקי ריביות", "הימורי מדיניות הפד", "סחורות"],
+        "level": "🔴 גבוהה",
+        "note": "נתוני אינפלציה מזיזים ציפיות ריבית ושווקי תחזיות",
+    },
+    {
+        "triggers": ["recession", "gdp", "unemployment", "payroll", "jobs"],
+        "markets": ["הימורי מיתון (Poly/Kalshi)", "שוקי מניות", "אג\"ח"],
+        "level": "🟡 בינונית-גבוהה",
+        "note": "נתוני תעסוקה וצמיחה משפיעים על הימורי מיתון והרגשת השוק",
+    },
+    {
+        "triggers": ["tariff", "trade war", "trade deal", "import tax"],
+        "markets": ["הימורי מלחמת סחר", "שווקי מניות בינלאומיים", "מט\"ח"],
+        "level": "🟡 בינונית-גבוהה",
+        "note": "מכסים יכולים לזעזע שווקים ולהשפיע על הימורי סחר ומט\"ח",
+    },
+    # Crypto
+    {
+        "triggers": ["bitcoin", "btc", "crypto", "ethereum", "eth"],
+        "markets": ["הימורי מחיר ביטקוין", "הימורי ETF קריפטו", "אלטקוינים"],
+        "level": "🟡 בינונית",
+        "note": "חדשות קריפטו משפיעות על שווקי תחזיות מחירים ורגולציה",
+    },
+    {
+        "triggers": ["etf approval", "sec crypto", "crypto regulation", "stablecoin bill"],
+        "markets": ["הימורי אישור ETF", "הימורי רגולציה", "מחירי קריפטו"],
+        "level": "🔴 גבוהה",
+        "note": "החלטות רגולציה משנות את שוק הקריפטו באופן מהותי",
+    },
+    # Politics / Elections
+    {
+        "triggers": ["election", "poll", "primary", "ballot", "swing state"],
+        "markets": ["הימורי בחירות (Poly/Kalshi)", "הימורי מדינות מפתח", "הימורי סנאט"],
+        "level": "🔴 גבוהה",
+        "note": "עדכוני בחירות משפיעים ישירות על שוקי ההימורים הפוליטיים",
+    },
+    {
+        "triggers": ["impeach", "resign", "scandal", "indictment", "trial"],
+        "markets": ["הימורי הדחה/התפטרות", "הימורי בחירות", "שוקי מניות"],
+        "level": "🟡 בינונית-גבוהה",
+        "note": "אירועים משפטיים/פוליטיים יכולים לשנות סיכויי מועמדים",
+    },
+    {
+        "triggers": ["legislation", "bill pass", "executive order", "congress vote", "senate vote"],
+        "markets": ["הימורי חקיקה", "הימורים ענפיים רלוונטיים"],
+        "level": "🟡 בינונית",
+        "note": "חקיקה חדשה יכולה לפתוח או לסגור שווקי הימורים",
+    },
+    # Geopolitics
+    {
+        "triggers": ["war", "invasion", "conflict", "attack", "missile", "military"],
+        "markets": ["הימורי גיאופוליטיקה", "נפט וסחורות", "שוקי מניות", "מט\"ח"],
+        "level": "🔴 גבוהה",
+        "note": "אירועים צבאיים גורמים לתנודתיות חדה בכל השווקים",
+    },
+    {
+        "triggers": ["ceasefire", "peace deal", "treaty", "negotiation"],
+        "markets": ["הימורי הפסקת אש/שלום", "נפט", "שוקי מניות אזוריים"],
+        "level": "🟡 בינונית-גבוהה",
+        "note": "הפסקות אש והסכמי שלום מזיזים שווקי תחזיות גיאופוליטיים",
+    },
+    # Tech
+    {
+        "triggers": ["ai ", "artificial intelligence", "openai", "chatgpt", "agi"],
+        "markets": ["הימורי AI (אבני דרך)", "מניות טכנולוגיה"],
+        "level": "🟡 בינונית",
+        "note": "פריצות דרך ב-AI משפיעות על הימורי אבני דרך טכנולוגיים",
+    },
+    {
+        "triggers": ["spacex", "launch", "nasa", "mars", "rocket"],
+        "markets": ["הימורי שיגורים/חלל", "הימורי SpaceX"],
+        "level": "🟢 נמוכה-בינונית",
+        "note": "אירועי חלל משפיעים על הימורי שיגור ספציפיים",
+    },
+    # Climate
+    {
+        "triggers": ["hurricane", "earthquake", "wildfire", "flood", "storm"],
+        "markets": ["הימורי אקלים/מזג אוויר", "ביטוח", "סחורות חקלאיות"],
+        "level": "🟡 בינונית",
+        "note": "אירועי מזג אוויר קיצוניים משפיעים על הימורי אקלים וסחורות",
+    },
+    {
+        "triggers": ["sanction", "embargo", "ban"],
+        "markets": ["הימורי סנקציות", "נפט", "מט\"ח של מדינות מעורבות"],
+        "level": "🟡 בינונית-גבוהה",
+        "note": "סנקציות חדשות מזיזות שווקי אנרגיה והימורי גיאופוליטיקה",
+    },
+]
+
+
+def analyze_impact(title: str, summary: str = "") -> str:
+    """Analyze which betting markets could be affected and at what level."""
+    text = f"{title} {summary}".lower()
+    impacts = []
+
+    for rule in IMPACT_RULES:
+        if any(trigger in text for trigger in rule["triggers"]):
+            impacts.append(rule)
+
+    if not impacts:
+        return ""
+
+    # Deduplicate by level+note
+    seen = set()
+    unique = []
+    for imp in impacts:
+        key = imp["note"]
+        if key not in seen:
+            seen.add(key)
+            unique.append(imp)
+
+    lines = ["\n🎰 *השפעה על הימורים:*"]
+    for imp in unique[:3]:  # Max 3 impacts per alert
+        markets_str = ", ".join(imp["markets"][:4])
+        lines.append(f"  {imp['level']} — {markets_str}")
+        lines.append(f"  💡 {imp['note']}")
+
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════
 
 def classify(title):
     t = title.lower()
@@ -197,6 +292,10 @@ def normalize(title):
     t = re.sub(r"^(will|is|does|has|can)\s+", "", t)
     t = re.sub(r"\?$", "", t)
     return re.sub(r"\s+", " ", t)
+
+
+def cat_he(cat):
+    return CATEGORY_HEBREW.get(cat, "אחר")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -250,6 +349,7 @@ async def fetch_polymarket(session, limit=100, min_vol=10000):
             events.append({
                 "id": f"poly_{ev.get('id', '')}",
                 "title": title,
+                "title_he": translate_title(title),
                 "category": classify(title),
                 "yes_price": outcomes[0]["price"],
                 "volume": vol,
@@ -290,9 +390,11 @@ async def fetch_kalshi(session, limit=200, min_vol=100):
                 continue
             yp = (m.get("yes_ask", 0) or m.get("last_price", 0) or 0) / 100.0
             ticker = m.get("ticker", "")
+            title = m.get("title", "Unknown")
             markets.append({
                 "id": f"kalshi_{m.get('id', '')}",
-                "title": m.get("title", "Unknown"),
+                "title": title,
+                "title_he": translate_title(title),
                 "category": cat_map.get(m.get("category", ""), "other"),
                 "yes_price": yp,
                 "volume": vol,
@@ -341,8 +443,17 @@ async def fetch_rss(session, since=None):
                     if not any(kw in text for kw in RSS_KEYWORDS):
                         continue
 
-                    items.append({"feed": fi["name"], "cat": cat, "title": title,
-                                  "summary": summary, "link": link, "guid": guid, "pub": pub})
+                    items.append({
+                        "feed": fi["name"],
+                        "cat": cat,
+                        "title": title,
+                        "title_he": translate_title(title),
+                        "summary": summary,
+                        "summary_he": translate_title(summary),
+                        "link": link,
+                        "guid": guid,
+                        "pub": pub,
+                    })
             except Exception as e:
                 logger.warning(f"RSS {fi['name']}: {e}")
 
@@ -379,10 +490,15 @@ def match_and_find_gaps(poly, kalshi, threshold=None):
             gap = abs(pp - kp) * 100
             if gap >= threshold:
                 alerts.append({
-                    "name": pe["title"], "cat": pe["category"],
-                    "poly": round(pp, 1), "kalshi": round(kp, 1),
-                    "gap": round(gap), "dir": "Poly > Kalshi" if pp > kp else "Kalshi > Poly",
-                    "poly_url": pe["url"], "kalshi_url": best["url"],
+                    "name": pe["title"],
+                    "name_he": pe.get("title_he", pe["title"]),
+                    "cat": pe["category"],
+                    "poly": round(pp, 1),
+                    "kalshi": round(kp, 1),
+                    "gap": round(gap),
+                    "dir": "Poly גבוה יותר" if pp > kp else "Kalshi גבוה יותר",
+                    "poly_url": pe["url"],
+                    "kalshi_url": best["url"],
                 })
     alerts.sort(key=lambda a: a["gap"], reverse=True)
     return alerts
@@ -400,10 +516,15 @@ def find_big_moves(current, previous, info, threshold=None):
         if delta >= threshold:
             i = info.get(mid, {})
             alerts.append({
-                "name": i.get("title", mid), "cat": i.get("category", "other"),
-                "src": i.get("source", "?"), "old": round(old_p * 100, 1),
-                "new": round(new_p * 100, 1), "delta": round(delta),
-                "tf": f"{CHECK_INTERVAL} min", "url": i.get("url", ""),
+                "name": i.get("title", mid),
+                "name_he": i.get("title_he", i.get("title", mid)),
+                "cat": i.get("category", "other"),
+                "src": i.get("source", "?"),
+                "old": round(old_p * 100, 1),
+                "new": round(new_p * 100, 1),
+                "delta": round(delta),
+                "tf": f"{CHECK_INTERVAL} דקות",
+                "url": i.get("url", ""),
             })
     alerts.sort(key=lambda a: a["delta"], reverse=True)
     return alerts
@@ -456,7 +577,7 @@ class State:
 
 
 # ═══════════════════════════════════════════════════════════
-# TELEGRAM
+# TELEGRAM (HEBREW ONLY)
 # ═══════════════════════════════════════════════════════════
 
 class Notifier:
@@ -475,38 +596,64 @@ class Notifier:
             logger.error(f"TG error: {e}")
             return False
 
-    async def multi(self, key, **kw):
-        for lang in LANGUAGES:
-            await self.send(tr(key, lang, **kw))
-            await asyncio.sleep(0.5)
-
     async def startup(self):
-        await self.multi("bot_started", interval=CHECK_INTERVAL, threshold=ALERT_THRESHOLD)
+        msg = (
+            "🚀 בוט מודיעין שווקים הופעל!\n\n"
+            "🔍 מצב: פעיל\n"
+            f"⏰ תדירות: כל {CHECK_INTERVAL} דקות\n"
+            "📊 מקורות: Polymarket, Kalshi, RSS\n"
+            f'🎯 סף התראה: {ALERT_THRESHOLD}+ נ"ב\n'
+            "🌐 שפה: עברית\n"
+            "🎰 כולל ניתוח השפעה על הימורים"
+        )
+        await self.send(msg)
 
     async def gap_alert(self, a):
-        for lang in LANGUAGES:
-            t1 = tr("gap_title", lang, name=a["name"])
-            t2 = tr("gap_body", lang, **a)
-            await self.send(f"{t1}\n\n{t2}")
-            await asyncio.sleep(0.5)
+        impact = analyze_impact(a["name"])
+        msg = (
+            f"🔔 התראת פער — {a['name_he']}\n\n"
+            f"📊 שוק: {a['name_he']}\n"
+            f"🏷️ קטגוריה: {cat_he(a['cat'])}\n\n"
+            f"Polymarket: {a['poly']}%\n"
+            f"Kalshi: {a['kalshi']}%\n"
+            f'📐 פער: {a["gap"]} נ"ב\n'
+            f"📈 כיוון: {a['dir']}\n"
+            f"{impact}\n\n"
+            f"🔗 Poly: {a['poly_url']}\n"
+            f"🔗 Kalshi: {a['kalshi_url']}"
+        )
+        await self.send(msg)
 
     async def move_alert(self, a):
-        for lang in LANGUAGES:
-            t1 = tr("move_title", lang, name=a["name"])
-            t2 = tr("move_body", lang, **a)
-            await self.send(f"{t1}\n\n{t2}")
-            await asyncio.sleep(0.5)
+        impact = analyze_impact(a["name"])
+        msg = (
+            f"⚡ תנועה גדולה — {a['name_he']}\n\n"
+            f"📊 {a['name_he']}\n"
+            f"🏷️ קטגוריה: {cat_he(a['cat'])}\n"
+            f"מקור: {a['src']}\n\n"
+            f"לפני: {a['old']}% → עכשיו: {a['new']}%\n"
+            f'📐 תנועה: {a["delta"]} נ"ב\n'
+            f"⏱️ טווח: {a['tf']}\n"
+            f"{impact}\n\n"
+            f"🔗 {a['url']}"
+        )
+        await self.send(msg)
 
     async def rss_alert(self, item):
-        for lang in LANGUAGES:
-            t1 = tr("rss_title", lang, feed=item["feed"])
-            t2 = tr("rss_body", lang, **item)
-            await self.send(f"{t1}\n\n{t2}")
-            await asyncio.sleep(0.5)
+        impact = analyze_impact(item["title"], item.get("summary", ""))
+        msg = (
+            f"📰 {item['feed']} — עדכון חדש\n\n"
+            f"📌 {item['title_he']}\n\n"
+            f"{item['summary_he'][:300]}\n"
+            f"{impact}\n\n"
+            f"🔗 {item['link']}"
+        )
+        await self.send(msg)
 
     async def heartbeat(self, mc, fc):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        await self.send(tr("heartbeat", LANGUAGES[0], ts=ts, mc=mc, fc=fc))
+        msg = f"💓 הבוט פעיל — {ts}\nשווקים במעקב: {mc}\nפידים במעקב: {fc}"
+        await self.send(msg)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -535,8 +682,13 @@ async def scan(state, notifier):
             info = {}
             for m in poly + kalshi_data:
                 current[m["id"]] = m["yes_price"]
-                info[m["id"]] = {"title": m["title"], "category": m["category"],
-                                 "source": m["source"], "url": m["url"]}
+                info[m["id"]] = {
+                    "title": m["title"],
+                    "title_he": m.get("title_he", m["title"]),
+                    "category": m["category"],
+                    "source": m["source"],
+                    "url": m["url"],
+                }
 
             # Big moves
             moves = find_big_moves(current, state.prices, {**state.info, **info})
@@ -576,7 +728,7 @@ async def scan(state, notifier):
     except Exception as e:
         logger.exception(f"Scan error: {e}")
         try:
-            await notifier.send(f"⚠️ Error: {str(e)[:500]}")
+            await notifier.send(f"⚠️ שגיאה: {str(e)[:500]}")
         except Exception:
             pass
 
