@@ -233,10 +233,24 @@ async def ai_analyze_correlation(session, market_a, market_b, price_a, price_b, 
     return parse_claude_json(await ask_claude(session, prompt))
 
 
-async def ai_analyze_big_move(session, market, old_price, new_price, timeframe):
-    """Deep AI analysis of a big price move."""
+async def ai_analyze_big_move(session, market, old_price, new_price, timeframe, recent_news=None):
+    """Analyze a big price move using REAL recent news — not guessing."""
     direction = "עלייה" if new_price > old_price else "ירידה"
-    prompt = f"""נתח תנועת מחיר גדולה בשוק הימורים הקשור לאיראן:
+
+    news_context = ""
+    if recent_news:
+        news_lines = "\n".join([
+            f"  - [{n['source']}] {n['title']}"
+            for n in recent_news[:8]
+        ])
+        news_context = f"""
+══ חדשות אחרונות שנמצאו (השתמש בהן!) ══
+{news_lines}
+"""
+    else:
+        news_context = "\n══ לא נמצאו חדשות רלוונטיות ══\n"
+
+    prompt = f"""שוק הימורים הקשור לאיראן זז בצורה משמעותית:
 
 שוק: {market['title']}
 מחיר קודם: {old_price}%
@@ -244,16 +258,24 @@ async def ai_analyze_big_move(session, market, old_price, new_price, timeframe):
 שינוי: {new_price - old_price:+.1f}%
 כיוון: {direction}
 טווח זמן: {timeframe}
+{news_context}
+
+הוראות קריטיות:
+1. אם יש חדשות רלוונטיות — השתמש בהן כדי להסביר את התנועה. אל תנחש!
+2. אם אין חדשות — אמור בפירוש שלא ברור מה גרם לתנועה
+3. אל תמציא סיבות. אם אתה לא יודע — אמור "לא ברור"
+4. התמקד בתחזית קדימה: מה צפוי לקרות עכשיו?
 
 ענה ב-JSON:
 {{
     "title_he": "שם השוק בעברית",
-    "what_happened": "מה כנראה גרם לתנועה הזו (3-4 משפטים, התבסס על ידע על המצב באיראן)",
-    "significance": "כמה זה משמעותי ולמה (2-3 משפטים)",
-    "impact_on_related": "איך זה עשוי להשפיע על שווקים קשורים אחרים (2-3 משפטים)",
-    "direction_forecast": "האם התנועה צפויה להמשיך, להתהפך, או להתייצב (2-3 משפטים)",
-    "recommendation": "המלצה ספציפית (2-3 משפטים)",
-    "watch_factors": ["גורם 1", "גורם 2", "גורם 3"],
+    "cause": "מה גרם לתנועה — על סמך חדשות אמיתיות בלבד. אם אין חדשות רלוונטיות כתוב 'הסיבה לא ברורה כרגע' (2-3 משפטים)",
+    "news_based": true או false,
+    "forward_prediction": "תחזית קדימה: מה צפוי לקרות בשוק הזה בימים הקרובים, על סמך החדשות והמגמה (3-4 משפטים)",
+    "related_markets_prediction": "אילו שווקים אחרים צפויים לזוז בעקבות זה, ולאיזה כיוון (2-3 משפטים)",
+    "action_window": "חלון הפעולה: כמה זמן לדעתך ההזדמנות פתוחה (משפט אחד)",
+    "recommendation": "המלצה ספציפית — מה לעשות עכשיו (2-3 משפטים)",
+    "watch_factors": ["גורם 1 לעקוב שישפיע על הכיוון", "גורם 2", "גורם 3"],
     "confidence": "גבוהה" או "בינונית" או "נמוכה"
 }}"""
     return parse_claude_json(await ask_claude(session, prompt))
@@ -316,7 +338,7 @@ async def ai_filter_news(session, news_items, knowledge_base, sent_topics):
 
 
 async def ai_analyze_news(session, news_items, current_markets, knowledge_base):
-    """AI analysis of news + its impact on current Iran markets, WITH context of what we already know."""
+    """PREDICTIVE analysis: news → forecast which markets WILL move and how."""
     markets_summary = "\n".join([
         f"  - {m['title']}: {m['yes_price']*100:.1f}% ({m['source']})"
         for m in current_markets[:15]
@@ -327,38 +349,45 @@ async def ai_analyze_news(session, news_items, current_markets, knowledge_base):
         for item in news_items[:5]
     ])
 
-    prompt = f"""התקבלו חדשות חדשות הקשורות לאיראן. נתח את ההשפעה על שווקי ההימורים.
+    prompt = f"""אתה אנליסט שווקי הימורים. התפקיד שלך: לקרוא חדשות ולחזות איך שווקי ההימורים יגיבו — לפני שזה קורה.
 
-══ מה שאנחנו כבר יודעים (מצב עדכני) ══
+══ מה שאנחנו כבר יודעים ══
 {knowledge_base or "(אין מידע קודם)"}
 
-══ חדשות חדשות שעברו סינון (רק מידע חדש באמת) ══
+══ חדשות חדשות ══
 {news_text}
 
 ══ שווקים פעילים כרגע ══
 {markets_summary}
 
-חשוב: התייחס לחדשות בהקשר של מה שכבר ידוע. אם למשל חמינאי כבר הוכרז כמת, אל תציג את זה כחדשות — התמקד במה שחדש (תגובות, מינויים, השפעות).
+הוראות:
+1. אל תסכם את החדשות — המשתמש יכול לקרוא בעצמו
+2. התמקד ב: מה החדשות האלה אומרות על העתיד של השווקים
+3. חזה תנועות ספציפיות: איזה שוק, לאיזה כיוון, בכמה, ומתי
+4. אם חדשה מצביעה על הזדמנות — ציין אותה בבירור
+5. היה ספציפי: "שוק X צפוי לעלות מ-60% ל-70-75% תוך 24-48 שעות" — לא "ייתכן שיהיה שינוי"
 
 ענה ב-JSON:
 {{
-    "headline_he": "כותרת ראשית בעברית שמסכמת רק את מה שחדש באמת (משפט אחד)",
-    "summary_he": "סיכום מפורט בעברית — רק הפרטים החדשים שלא ידענו קודם (3-5 משפטים)",
-    "market_impact": [
+    "headline_he": "כותרת קצרה שמתמקדת בהשפעה על ההימורים, לא בחדשות עצמן (משפט אחד)",
+    "news_summary_he": "סיכום קצר בלבד של החדשות (2 משפטים מקסימום)",
+    "predictions": [
         {{
-            "market": "שם השוק המושפע",
+            "market": "שם השוק שצפוי לזוז",
             "current_price": "המחיר הנוכחי",
-            "expected_direction": "עלייה" או "ירידה" או "ללא שינוי",
-            "impact_level": "🔴 גבוהה" או "🟡 בינונית" או "🟢 נמוכה",
-            "explanation": "למה השוק הזה מושפע (משפט אחד)"
+            "predicted_price": "המחיר הצפוי",
+            "direction": "עלייה" או "ירידה",
+            "timeframe": "תוך כמה זמן (שעות/ימים)",
+            "confidence": "גבוהה/בינונית/נמוכה",
+            "logic": "למה — הקשר ישיר בין החדשה לתנועה הצפויה (משפט אחד)"
         }}
     ],
-    "key_insight": "התובנה המרכזית — מה הדבר הכי חשוב מהחדשות החדשות (2-3 משפטים)",
-    "recommendation": "המלצה (2-3 משפטים)",
+    "opportunity": "ההזדמנות המרכזית: מה אפשר לעשות עכשיו לפני שהשוק יגיב (2-3 משפטים)",
+    "risk_warning": "סיכונים: מה יכול להשתבש עם התחזית (1-2 משפטים)",
+    "action_items": ["פעולה ספציפית 1", "פעולה ספציפית 2"],
     "urgency": "דחוף" או "חשוב" או "לידיעה",
-    "watch_factors": ["גורם 1", "גורם 2"],
-    "confidence": "גבוהה" או "בינונית" או "נמוכה",
-    "topic_summary": "תיאור קצר של הנושא בשביל מניעת כפילויות עתידיות (10-15 מילים)"
+    "overall_confidence": "גבוהה" או "בינונית" או "נמוכה",
+    "topic_summary": "תיאור קצר של הנושא (10-15 מילים)"
 }}"""
     return parse_claude_json(await ask_claude(session, prompt, max_tokens=2000))
 
@@ -1018,23 +1047,26 @@ class Notifier:
         m = move["market"]
         arrow = "📈" if move["delta"] > 0 else "📉"
         confidence = ai.get("confidence", "—")
+        news_based = ai.get("news_based", False)
+        source_tag = "📰 מבוסס חדשות" if news_based else "⚠️ הסיבה לא ברורה"
 
         msg = (
             f"{arrow} תנועה גדולה\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📊 {ai.get('title_he', m['title'])}\n"
-            f"מקור: {m['source']}\n\n"
+            f"מקור: {m['source']}\n"
+            f"{source_tag}\n\n"
             f"לפני: {move['old_price']}% → עכשיו: {move['new_price']}%\n"
             f"שינוי: {move['delta']:+.1f}%\n\n"
         )
-        if ai.get("what_happened"):
-            msg += f"📋 מה קרה:\n{ai['what_happened']}\n\n"
-        if ai.get("significance"):
-            msg += f"⚡ משמעות:\n{ai['significance']}\n\n"
-        if ai.get("impact_on_related"):
-            msg += f"🔗 השפעה על שווקים קשורים:\n{ai['impact_on_related']}\n\n"
-        if ai.get("direction_forecast"):
-            msg += f"🔮 תחזית כיוון:\n{ai['direction_forecast']}\n\n"
+        if ai.get("cause"):
+            msg += f"❓ למה זה קרה:\n{ai['cause']}\n\n"
+        if ai.get("forward_prediction"):
+            msg += f"🔮 תחזית קדימה:\n{ai['forward_prediction']}\n\n"
+        if ai.get("related_markets_prediction"):
+            msg += f"🔗 שווקים שצפויים לזוז:\n{ai['related_markets_prediction']}\n\n"
+        if ai.get("action_window"):
+            msg += f"⏰ חלון פעולה: {ai['action_window']}\n\n"
         if ai.get("recommendation"):
             msg += f"💡 המלצה:\n{ai['recommendation']}\n\n"
         if ai.get("watch_factors"):
@@ -1051,35 +1083,41 @@ class Notifier:
     async def send_news(self, ai: dict, news_items: list):
         urgency = ai.get("urgency", "לידיעה")
         urgency_emoji = {"דחוף": "🚨", "חשוב": "⚠️", "לידיעה": "ℹ️"}.get(urgency, "ℹ️")
-        confidence = ai.get("confidence", "—")
+        confidence = ai.get("overall_confidence", ai.get("confidence", "—"))
 
         msg = (
-            f"📰 חדשות איראן {urgency_emoji}\n"
+            f"{urgency_emoji} תחזית שווקים — איראן\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📌 {ai.get('headline_he', 'עדכון חדש')}\n\n"
         )
-        if ai.get("summary_he"):
-            msg += f"{ai['summary_he']}\n\n"
+        if ai.get("news_summary_he"):
+            msg += f"📰 מה קרה: {ai['news_summary_he']}\n\n"
 
-        # Market impact
-        impacts = ai.get("market_impact", [])
-        if impacts:
-            msg += "🎰 השפעה על שווקים:\n"
-            for imp in impacts[:5]:
-                direction = imp.get("expected_direction", "—")
-                level = imp.get("impact_level", "🟡")
-                dir_emoji = "📈" if direction == "עלייה" else "📉" if direction == "ירידה" else "➡️"
-                msg += f"  {level} {imp.get('market', '—')} ({imp.get('current_price', '—')})\n"
-                msg += f"    {dir_emoji} {direction} — {imp.get('explanation', '')}\n"
+        # Predictions - the main event
+        predictions = ai.get("predictions", [])
+        if predictions:
+            msg += "🔮 תחזיות תנועה:\n"
+            for pred in predictions[:5]:
+                direction = pred.get("direction", "—")
+                dir_emoji = "📈" if direction == "עלייה" else "📉"
+                conf = pred.get("confidence", "—")
+                msg += (
+                    f"\n  {dir_emoji} {pred.get('market', '—')}\n"
+                    f"    עכשיו: {pred.get('current_price', '—')} → צפי: {pred.get('predicted_price', '—')}\n"
+                    f"    ⏰ {pred.get('timeframe', '—')} | ביטחון: {conf}\n"
+                    f"    💬 {pred.get('logic', '')}\n"
+                )
             msg += "\n"
 
-        if ai.get("key_insight"):
-            msg += f"💡 תובנה מרכזית:\n{ai['key_insight']}\n\n"
-        if ai.get("recommendation"):
-            msg += f"📝 המלצה:\n{ai['recommendation']}\n\n"
-        if ai.get("watch_factors"):
-            factors = "\n".join([f"  • {f}" for f in ai["watch_factors"]])
-            msg += f"👁️ גורמים לעקוב:\n{factors}\n\n"
+        if ai.get("opportunity"):
+            msg += f"💰 הזדמנות:\n{ai['opportunity']}\n\n"
+        if ai.get("risk_warning"):
+            msg += f"⚠️ סיכונים:\n{ai['risk_warning']}\n\n"
+
+        action_items = ai.get("action_items", [])
+        if action_items:
+            items = "\n".join([f"  ✅ {a}" for a in action_items])
+            msg += f"📋 פעולות מומלצות:\n{items}\n\n"
 
         # Source links
         msg += "🔗 מקורות:\n"
@@ -1087,7 +1125,7 @@ class Notifier:
             msg += f"  • {item['source']}: {item['link']}\n"
 
         msg += (
-            f"\n🎯 רמת ביטחון: {confidence}\n"
+            f"\n🎯 רמת ביטחון כוללת: {confidence}\n"
             "━━━━━━━━━━━━━━━━━━━━━━"
         )
         await self.send(msg)
@@ -1161,15 +1199,23 @@ async def market_scan():
                 await notifier.send_arbitrage(opp, ai)
                 state.mark_arb_alert(alert_key)
 
-            # ── 2. Big Moves ──
+            # ── 2. Big Moves — fetch news to explain WHY ──
             big_moves = find_big_moves(all_markets, state.price_history)
+            if big_moves:
+                # Fetch fresh news to explain the moves
+                move_news = await fetch_iran_news(s)
+                logger.info(f"Fetched {len(move_news)} news items to explain {len(big_moves)} moves")
+            else:
+                move_news = []
+
             for move in big_moves[:3]:
                 mid = move["market"]["id"]
                 if not state.can_alert_move(mid):
                     continue
                 logger.info(f"📈 BIG MOVE: {move['market']['title']} — {move['delta']:+.1f}%")
                 ai = await ai_analyze_big_move(
-                    s, move["market"], move["old_price"], move["new_price"], "24 שעות"
+                    s, move["market"], move["old_price"], move["new_price"],
+                    "24 שעות", recent_news=move_news
                 )
                 if not ai:
                     ai = {"title_he": move["market"]["title"]}
@@ -1262,7 +1308,7 @@ async def news_scan():
                 if topic_summary:
                     state.sent_topics.append(topic_summary)
 
-                summary_he = ai.get("summary_he", "")
+                summary_he = ai.get("news_summary_he", "")
                 if summary_he:
                     news_titles = [item["title"] for item in filtered]
                     updated_kb = await ai_update_knowledge(
