@@ -126,19 +126,33 @@ AI_SYSTEM = """אתה אנליסט מודיעין בכיר המתמחה בשוו
 - הדינמיקה האזורית (איראן-ישראל, איראן-ארה"ב)
 - שוקי הימורים (Polymarket, Kalshi) ואיך לזהות הזדמנויות
 
-כללים:
+כללים קריטיים:
 1. כתוב תמיד בעברית
-2. היה מדויק ומבוסס עובדות
+2. היה מדויק ומבוסס עובדות — אל תמציא סיבות
 3. ציין תמיד רמת ביטחון
 4. אל תפחד להגיד "לא ברור" כשאין מספיק מידע
-5. ענה תמיד ב-JSON בלבד, בלי backticks"""
+5. ענה תמיד ב-JSON בלבד, בלי backticks
+
+כללים לגבי תאריכים ותזמון:
+6. שווקים שהתאריך שלהם כבר עבר הם לא רלוונטיים — אל תנתח אותם, אל תחזה להם תנועות
+7. כשאתה חוזה תזמון, היה ספציפי ולוגי — אל תגיד "12 שעות" סתם. הסבר למה דווקא טווח הזמן הזה
+8. אם אירוע קרה לפני X שעות ולא היה שינוי עד עכשיו, אל תחזה שינוי מיידי אלא אם יש סיבה חדשה ספציפית
+9. לגבי תחזיות: מה האירוע הבא שעשוי לגרום לתנועה? (למשל: הכרזה רשמית, פגישה, הלוויה, מינוי)"""
+
+
+def get_current_datetime_str():
+    """Get current date/time string for AI context."""
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%d %H:%M UTC")
 
 
 async def ask_claude(session: aiohttp.ClientSession, prompt: str, max_tokens: int = 1500) -> Optional[str]:
-    """Call Claude API."""
+    """Call Claude API with current date context."""
     if not ANTHROPIC_API_KEY:
         logger.warning("No ANTHROPIC_API_KEY set")
         return None
+
+    date_context = f"\n\n[תאריך ושעה נוכחיים: {get_current_datetime_str()}]\n\n"
 
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
@@ -149,7 +163,7 @@ async def ask_claude(session: aiohttp.ClientSession, prompt: str, max_tokens: in
         "model": CLAUDE_MODEL,
         "max_tokens": max_tokens,
         "system": AI_SYSTEM,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": date_context + prompt}],
     }
 
     try:
@@ -360,12 +374,17 @@ async def ai_analyze_news(session, news_items, current_markets, knowledge_base):
 ══ שווקים פעילים כרגע ══
 {markets_summary}
 
-הוראות:
+הוראות קריטיות:
 1. אל תסכם את החדשות — המשתמש יכול לקרוא בעצמו
 2. התמקד ב: מה החדשות האלה אומרות על העתיד של השווקים
 3. חזה תנועות ספציפיות: איזה שוק, לאיזה כיוון, בכמה, ומתי
 4. אם חדשה מצביעה על הזדמנות — ציין אותה בבירור
 5. היה ספציפי: "שוק X צפוי לעלות מ-60% ל-70-75% תוך 24-48 שעות" — לא "ייתכן שיהיה שינוי"
+6. בדוק את התאריך הנוכחי! אם שוק מתייחס לתאריך שכבר עבר (למשל "ינואר 2026" כשאנחנו במרץ 2026) — התעלם ממנו לחלוטין, אל תכלול אותו בתחזיות
+7. לגבי תזמון התחזיות — היה לוגי:
+   - ציין מה האירוע הבא שיגרום לתנועה (למשל: "הכרזה רשמית על יורש", "הלוויה", "הצבעה במועצת המומחים")
+   - אם אירוע כבר קרה לפני 20 שעות והשוק כבר הגיב — אל תחזה תנועה נוספת אלא אם יש טריגר חדש ספציפי
+   - הטווח צריך להיות מבוסס על אירוע צפוי, לא מספר שרירותי
 
 ענה ב-JSON:
 {{
@@ -377,7 +396,8 @@ async def ai_analyze_news(session, news_items, current_markets, knowledge_base):
             "current_price": "המחיר הנוכחי",
             "predicted_price": "המחיר הצפוי",
             "direction": "עלייה" או "ירידה",
-            "timeframe": "תוך כמה זמן (שעות/ימים)",
+            "trigger_event": "מה האירוע הספציפי שיגרום לתנועה (למשל: 'הכרזה רשמית על יורש', 'תוצאות הצבעה')",
+            "timeframe": "מתי צפוי הטריגר (לא מספר שרירותי — מבוסס על האירוע)",
             "confidence": "גבוהה/בינונית/נמוכה",
             "logic": "למה — הקשר ישיר בין החדשה לתנועה הצפויה (משפט אחד)"
         }}
@@ -434,6 +454,35 @@ def is_iran_market(title: str, description: str = "") -> bool:
     return any(kw in text for kw in IRAN_KEYWORDS)
 
 
+def is_expired_market(title: str) -> bool:
+    """Check if a market's date has already passed."""
+    now = datetime.now(timezone.utc)
+    text = title.lower()
+
+    # Month names to numbers
+    months = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+        "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+
+    # Pattern: "by/in/before January 2026" or "in January 2026"
+    for month_name, month_num in months.items():
+        if month_name in text:
+            # Try to find a year nearby
+            year_match = re.search(r'20(\d{2})', text)
+            if year_match:
+                year = 2000 + int(year_match.group(1))
+                # If the end of that month is in the past
+                if year < now.year or (year == now.year and month_num < now.month):
+                    logger.debug(f"Expired market filtered: {title}")
+                    return True
+
+    return False
+
+
 async def fetch_polymarket_iran(session: aiohttp.ClientSession) -> list[dict]:
     """Fetch Iran-related markets from Polymarket."""
     markets = []
@@ -451,7 +500,7 @@ async def fetch_polymarket_iran(session: aiohttp.ClientSession) -> list[dict]:
         for ev in data:
             title = ev.get("title", "")
             desc = ev.get("description", "")
-            if not is_iran_market(title, desc):
+            if not is_iran_market(title, desc) or is_expired_market(title):
                 continue
 
             ev_markets = ev.get("markets", [])
@@ -483,6 +532,8 @@ async def fetch_polymarket_iran(session: aiohttp.ClientSession) -> list[dict]:
                     continue
 
                 m_title = m.get("question", m.get("groupItemTitle", title))
+                if is_expired_market(m_title):
+                    continue
                 markets.append({
                     "id": f"poly_{m.get('id', ev.get('id', ''))}",
                     "title": m_title,
@@ -511,7 +562,7 @@ async def fetch_polymarket_iran(session: aiohttp.ClientSession) -> list[dict]:
                     # Skip if already found
                     if any(f"poly_{ev_id}" in m["id"] for m in markets):
                         continue
-                    if not is_iran_market(title, ev.get("description", "")):
+                    if not is_iran_market(title, ev.get("description", "")) or is_expired_market(title):
                         continue
 
                     slug = ev.get("slug", "")
@@ -533,6 +584,8 @@ async def fetch_polymarket_iran(session: aiohttp.ClientSession) -> list[dict]:
                             continue
 
                         m_title = m.get("question", m.get("groupItemTitle", title))
+                        if is_expired_market(m_title):
+                            continue
                         markets.append({
                             "id": f"poly_{m.get('id', ev_id)}",
                             "title": m_title,
@@ -577,7 +630,7 @@ async def fetch_kalshi_iran(session: aiohttp.ClientSession) -> list[dict]:
         for m in data.get("markets", []):
             title = m.get("title", "")
             subtitle = m.get("subtitle", "")
-            if not is_iran_market(title, subtitle):
+            if not is_iran_market(title, subtitle) or is_expired_market(title):
                 continue
 
             yp = (m.get("yes_ask", 0) or m.get("last_price", 0) or 0) / 100.0
@@ -1104,6 +1157,7 @@ class Notifier:
                 msg += (
                     f"\n  {dir_emoji} {pred.get('market', '—')}\n"
                     f"    עכשיו: {pred.get('current_price', '—')} → צפי: {pred.get('predicted_price', '—')}\n"
+                    f"    🎯 טריגר: {pred.get('trigger_event', '—')}\n"
                     f"    ⏰ {pred.get('timeframe', '—')} | ביטחון: {conf}\n"
                     f"    💬 {pred.get('logic', '')}\n"
                 )
