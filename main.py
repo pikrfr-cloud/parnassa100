@@ -259,8 +259,64 @@ async def ai_analyze_big_move(session, market, old_price, new_price, timeframe):
     return parse_claude_json(await ask_claude(session, prompt))
 
 
-async def ai_analyze_news(session, news_items, current_markets):
-    """AI analysis of news + its impact on current Iran markets."""
+async def ai_filter_news(session, news_items, knowledge_base, sent_topics):
+    """AI decides which news items are truly NEW and worth sending."""
+    news_text = "\n".join([
+        f"  {i+1}. [{item['source']}] {item['title']}"
+        for i, item in enumerate(news_items[:10])
+    ])
+
+    topics_text = "\n".join([f"  - {t}" for t in sent_topics[-20:]]) if sent_topics else "  (אין נושאים קודמים)"
+
+    prompt = f"""אתה מסנן חדשות חכם. התפקיד שלך: לזהות אילו חדשות הן באמת חדשות ואילו הן חזרה על מידע ישן.
+
+══ מה שאנחנו כבר יודעים (מצב עדכני) ══
+{knowledge_base or "(אין מידע קודם — זו הסריקה הראשונה)"}
+
+══ נושאים שכבר דיווחנו עליהם ══
+{topics_text}
+
+══ חדשות שהתקבלו עכשיו ══
+{news_text}
+
+בדוק כל חדשה ושאל את עצמך:
+1. האם זה מידע שכבר ידוע לנו מהמצב העדכני?
+2. האם זה חוזר על נושא שכבר דיווחנו עליו?
+3. האם יש כאן פרט חדש משמעותי שלא ידענו?
+
+לדוגמה:
+- אם כבר ידוע שחמינאי מת → כתבה "חמינאי מת" = לא חדש, לסנן
+- אם כבר ידוע שחמינאי מת → כתבה "מוג'תבא מונה כממלא מקום" = חדש! לשלוח
+- אם כבר דיווחנו על סנקציות חדשות → כתבה נוספת על אותן סנקציות = לא חדש
+
+ענה ב-JSON בלבד:
+{{
+    "selected_indices": [1, 4],
+    "reasoning": "הסבר קצר למה בחרת רק את אלה ולמה סיננת את האחרים"
+}}
+
+אם אף חדשה לא מביאה מידע חדש, החזר: {{"selected_indices": [], "reasoning": "הסבר"}}"""
+
+    result = parse_claude_json(await ask_claude(session, prompt))
+    if not result:
+        return news_items[:3]  # Fallback: send first 3
+
+    selected = result.get("selected_indices", [])
+    reasoning = result.get("reasoning", "")
+    if reasoning:
+        logger.info(f"AI filter: {reasoning}")
+
+    filtered = []
+    for idx in selected:
+        i = idx - 1  # Convert 1-indexed to 0-indexed
+        if 0 <= i < len(news_items):
+            filtered.append(news_items[i])
+
+    return filtered
+
+
+async def ai_analyze_news(session, news_items, current_markets, knowledge_base):
+    """AI analysis of news + its impact on current Iran markets, WITH context of what we already know."""
     markets_summary = "\n".join([
         f"  - {m['title']}: {m['yes_price']*100:.1f}% ({m['source']})"
         for m in current_markets[:15]
@@ -273,16 +329,21 @@ async def ai_analyze_news(session, news_items, current_markets):
 
     prompt = f"""התקבלו חדשות חדשות הקשורות לאיראן. נתח את ההשפעה על שווקי ההימורים.
 
-חדשות חדשות:
+══ מה שאנחנו כבר יודעים (מצב עדכני) ══
+{knowledge_base or "(אין מידע קודם)"}
+
+══ חדשות חדשות שעברו סינון (רק מידע חדש באמת) ══
 {news_text}
 
-שווקים פעילים כרגע:
+══ שווקים פעילים כרגע ══
 {markets_summary}
+
+חשוב: התייחס לחדשות בהקשר של מה שכבר ידוע. אם למשל חמינאי כבר הוכרז כמת, אל תציג את זה כחדשות — התמקד במה שחדש (תגובות, מינויים, השפעות).
 
 ענה ב-JSON:
 {{
-    "headline_he": "כותרת ראשית בעברית שמסכמת את החדשות (משפט אחד)",
-    "summary_he": "סיכום מפורט בעברית של כל החדשות החדשות (3-5 משפטים)",
+    "headline_he": "כותרת ראשית בעברית שמסכמת רק את מה שחדש באמת (משפט אחד)",
+    "summary_he": "סיכום מפורט בעברית — רק הפרטים החדשים שלא ידענו קודם (3-5 משפטים)",
     "market_impact": [
         {{
             "market": "שם השוק המושפע",
@@ -292,13 +353,46 @@ async def ai_analyze_news(session, news_items, current_markets):
             "explanation": "למה השוק הזה מושפע (משפט אחד)"
         }}
     ],
-    "key_insight": "התובנה המרכזית — מה הדבר הכי חשוב שצריך להבין מהחדשות האלה (2-3 משפטים)",
+    "key_insight": "התובנה המרכזית — מה הדבר הכי חשוב מהחדשות החדשות (2-3 משפטים)",
     "recommendation": "המלצה (2-3 משפטים)",
     "urgency": "דחוף" או "חשוב" או "לידיעה",
     "watch_factors": ["גורם 1", "גורם 2"],
-    "confidence": "גבוהה" או "בינונית" או "נמוכה"
+    "confidence": "גבוהה" או "בינונית" או "נמוכה",
+    "topic_summary": "תיאור קצר של הנושא בשביל מניעת כפילויות עתידיות (10-15 מילים)"
 }}"""
     return parse_claude_json(await ask_claude(session, prompt, max_tokens=2000))
+
+
+async def ai_update_knowledge(session, current_knowledge, new_info, news_titles):
+    """AI updates the running knowledge base with new confirmed information."""
+    news_list = "\n".join([f"  - {t}" for t in news_titles[:5]])
+
+    prompt = f"""עדכן את מאגר הידע שלנו על המצב באיראן.
+
+══ מאגר ידע נוכחי ══
+{current_knowledge or "(ריק — זו ההתחלה)"}
+
+══ מידע חדש שהתקבל ══
+{new_info}
+
+══ כותרות מקור ══
+{news_list}
+
+כתוב מאגר ידע מעודכן. הכללים:
+1. שמור את כל המידע הישן שעדיין רלוונטי
+2. הוסף את המידע החדש
+3. אם מידע חדש סותר מידע ישן — עדכן (למשל: אם קודם כתבנו "חמינאי חולה" ועכשיו "חמינאי מת" — עדכן ל"מת")
+4. סמן תאריכים כשאפשר
+5. כתוב בצורה תמציתית — נקודות קצרות
+6. מקסימום 500 מילים
+
+ענה ב-JSON:
+{{
+    "updated_knowledge": "המאגר המעודכן כטקסט מובנה"
+}}"""
+
+    result = parse_claude_json(await ask_claude(session, prompt, max_tokens=1500))
+    return result.get("updated_knowledge", current_knowledge) if result else current_knowledge
 
 
 # ═══════════════════════════════════════════════════════════
@@ -708,6 +802,8 @@ class State:
         self.sent_move_alerts = {} # market_id → last_alert_ts
         self.last_news_check = None
         self.scan_count = 0
+        self.knowledge_base = ""   # AI-maintained summary of what we already know
+        self.sent_topics = []      # List of topic summaries already sent
         self._load()
 
     def _load(self):
@@ -722,8 +818,11 @@ class State:
                 self.sent_move_alerts = s.get("sent_move_alerts", {})
                 self.last_news_check = s.get("last_news_check")
                 self.scan_count = s.get("scan_count", 0)
+                self.knowledge_base = s.get("knowledge_base", "")
+                self.sent_topics = s.get("sent_topics", [])
                 logger.info(f"State loaded — scan #{self.scan_count}, "
-                           f"tracking {len(self.price_history)} markets")
+                           f"tracking {len(self.price_history)} markets, "
+                           f"knowledge: {len(self.knowledge_base)} chars")
             except Exception as e:
                 logger.warning(f"State load failed: {e}")
 
@@ -747,6 +846,8 @@ class State:
                     "sent_move_alerts": self.sent_move_alerts,
                     "last_news_check": self.last_news_check,
                     "scan_count": self.scan_count,
+                    "knowledge_base": self.knowledge_base,
+                    "sent_topics": self.sent_topics[-50:],
                 }, f)
         except Exception as e:
             logger.error(f"State save failed: {e}")
@@ -830,7 +931,8 @@ class Notifier:
             logger.error(f"TG error: {e}")
             return False
 
-    async def send_startup(self, market_count: int):
+    async def send_startup(self, market_count: int, has_memory: bool = False):
+        memory_status = "✅ פעיל" if has_memory else "🆕 ריק (יתמלא בסריקה הראשונה)"
         msg = (
             "🇮🇷 בוט מודיעין שווקי הימורים — איראן\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -842,6 +944,7 @@ class Notifier:
             f"📈 סף תנועה גדולה: {BIG_MOVE_THRESHOLD_PCT}%\n"
             f"🔗 סף קורלציה: {CORRELATION_MOVE_PCT}%\n"
             f"🧠 מנוע AI: {'✅' if ANTHROPIC_API_KEY else '❌'}\n"
+            f"💾 זיכרון AI: {memory_status}\n"
             "🌐 שפה: עברית\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━"
         )
@@ -1111,7 +1214,7 @@ async def market_scan():
 
 
 async def news_scan():
-    """News scan — runs every 5-10 minutes."""
+    """News scan — runs every 5-10 minutes. Uses AI memory to avoid duplicates."""
     global state, notifier
     logger.info("═══ News Scan ═══")
 
@@ -1120,40 +1223,64 @@ async def news_scan():
             # Fetch news
             news = await fetch_iran_news(s)
 
-            # Filter out already seen
+            # Stage 1: Filter out already seen GUIDs
             new_items = [n for n in news if n["guid"] not in state.seen_news]
             if not new_items:
-                logger.info("No new Iran news")
+                logger.info("No new Iran news (all GUIDs seen)")
                 return
 
-            # Take top 5 newest
-            new_items = new_items[:5]
+            new_items = new_items[:10]  # Take top 10 for AI filtering
 
-            # Get current markets for context
+            # Stage 2: AI FILTER — Claude decides what's truly new
+            logger.info(f"📰 {len(new_items)} new GUIDs — asking AI to filter...")
+            filtered = await ai_filter_news(s, new_items, state.knowledge_base, state.sent_topics)
+
+            # Mark ALL fetched items as seen (even filtered ones)
+            for item in new_items:
+                state.seen_news.append(item["guid"])
+
+            if not filtered:
+                logger.info("AI filter: nothing truly new — all filtered out")
+                state.save()
+                return
+
+            logger.info(f"AI filter: {len(filtered)} items passed (out of {len(new_items)})")
+
+            # Stage 3: Get current markets for context
             poly = await fetch_polymarket_iran(s)
             kalshi = await fetch_kalshi_iran(s)
             all_markets = poly + kalshi
 
-            # AI analysis
-            logger.info(f"📰 {len(new_items)} new Iran news items — analyzing...")
-            ai = await ai_analyze_news(s, new_items, all_markets)
+            # Stage 4: AI analysis WITH knowledge base context
+            ai = await ai_analyze_news(s, filtered, all_markets, state.knowledge_base)
 
             if ai:
-                await notifier.send_news(ai, new_items)
-            else:
-                # Fallback: send raw
-                for item in new_items[:2]:
-                    msg = (
-                        f"📰 חדשות איראן\n\n"
-                        f"📌 {item['title']}\n"
-                        f"מקור: {item['source']}\n"
-                        f"🔗 {item['link']}"
-                    )
-                    await notifier.send(msg)
+                await notifier.send_news(ai, filtered)
 
-            # Mark as seen
-            for item in new_items:
-                state.seen_news.append(item["guid"])
+                # Stage 5: Update knowledge base with new info
+                topic_summary = ai.get("topic_summary", "")
+                if topic_summary:
+                    state.sent_topics.append(topic_summary)
+
+                summary_he = ai.get("summary_he", "")
+                if summary_he:
+                    news_titles = [item["title"] for item in filtered]
+                    updated_kb = await ai_update_knowledge(
+                        s, state.knowledge_base, summary_he, news_titles
+                    )
+                    if updated_kb:
+                        state.knowledge_base = updated_kb
+                        logger.info(f"Knowledge base updated ({len(updated_kb)} chars)")
+            else:
+                # Fallback: send raw (only first item)
+                item = filtered[0]
+                msg = (
+                    f"📰 חדשות איראן\n\n"
+                    f"📌 {item['title']}\n"
+                    f"מקור: {item['source']}\n"
+                    f"🔗 {item['link']}"
+                )
+                await notifier.send(msg)
 
             state.last_news_check = datetime.now(timezone.utc).isoformat()
             state.save()
@@ -1184,7 +1311,7 @@ async def main():
             state.record_price(m["id"], m["yes_price"])
         state.save()
 
-    await notifier.send_startup(initial_count)
+    await notifier.send_startup(initial_count, has_memory=bool(state.knowledge_base))
 
     if "--once" in sys.argv:
         await market_scan()
