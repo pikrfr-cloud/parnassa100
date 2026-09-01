@@ -7,12 +7,13 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from config import Config
+from player_intel.models import LeaderboardEntry, Position
 
 logger = logging.getLogger(__name__)
 
 
 class BotState:
-    """Manages persistent state: previous prices, seen RSS GUIDs, run count."""
+    """Manages persistent state: previous prices, seen RSS GUIDs, player snapshots."""
 
     def __init__(self, state_file: str = None):
         self.state_file = state_file or Config.STATE_FILE
@@ -23,6 +24,8 @@ class BotState:
             "last_run": None,            # ISO timestamp
             "run_count": 0,
             "last_heartbeat": None,
+            "player_snapshots": {},      # address → {positions, last_trade_ts, alias, value}
+            "leaderboard": [],           # previous leaderboard rows
         }
         self._load()
 
@@ -34,14 +37,17 @@ class BotState:
                     saved = json.load(f)
                 self._state.update(saved)
                 logger.info(f"State loaded — run #{self._state['run_count']}, "
-                           f"tracking {len(self._state['previous_prices'])} markets")
+                           f"tracking {len(self._state['previous_prices'])} markets, "
+                           f"{len(self._state.get('player_snapshots', {}))} wallets")
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning(f"Could not load state: {e}. Starting fresh.")
 
     def save(self):
         """Persist state to disk."""
         try:
-            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            directory = os.path.dirname(self.state_file)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
             with open(self.state_file, "w") as f:
                 json.dump(self._state, f, indent=2, default=str)
         except OSError as e:
@@ -95,3 +101,47 @@ class BotState:
     def should_heartbeat(self, every_n_runs: int = 12) -> bool:
         """Send heartbeat every N runs (default: every 12 runs = 24h at 2h interval)."""
         return self._state["run_count"] % every_n_runs == 0
+
+    def has_player_snapshot(self, address: str) -> bool:
+        return address.lower() in self._state.get("player_snapshots", {})
+
+    def get_player_positions(self, address: str) -> dict[str, Position]:
+        snap = self._state.get("player_snapshots", {}).get(address.lower(), {})
+        raw = snap.get("positions") or {}
+        result: dict[str, Position] = {}
+        for key, row in raw.items():
+            if isinstance(row, dict):
+                pos = Position.from_dict(row)
+                result[pos.key or key] = pos
+        return result
+
+    def get_last_trade_ts(self, address: str) -> int:
+        snap = self._state.get("player_snapshots", {}).get(address.lower(), {})
+        try:
+            return int(snap.get("last_trade_ts") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def update_player_snapshot(
+        self,
+        address: str,
+        positions: dict[str, Position],
+        last_trade_ts: int,
+        alias: str = "",
+        value: float = 0.0,
+    ) -> None:
+        snapshots = self._state.setdefault("player_snapshots", {})
+        snapshots[address.lower()] = {
+            "alias": alias,
+            "value": value,
+            "last_trade_ts": last_trade_ts,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "positions": {key: pos.to_dict() for key, pos in positions.items()},
+        }
+
+    def get_leaderboard(self) -> list[LeaderboardEntry]:
+        rows = self._state.get("leaderboard") or []
+        return [LeaderboardEntry.from_dict(row) for row in rows if isinstance(row, dict)]
+
+    def update_leaderboard(self, entries: list[LeaderboardEntry]) -> None:
+        self._state["leaderboard"] = [entry.to_dict() for entry in entries]
