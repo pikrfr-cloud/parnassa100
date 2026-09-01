@@ -1,242 +1,371 @@
-import os
-import json
-import time
-import requests
-import anthropic
-from datetime import datetime
-from itertools import combinations
+#!/usr/bin/env python3
+"""
+Market Intelligence Bot + Polymarket player tracker (paper only)
+================================================================
+Monitors Polymarket, Kalshi, and RSS feeds for gaps/moves, and tracks
+named Polymarket wallets via the public Data API.
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-SCAN_INTERVAL_H = 4  # scan every N hours
-MIN_VOLUME = 500  # ignore markets below this $ volume
-MIN_OPPORTUNITY_SCORE = 7  # Claude scores 1-10, alert only if >= this
+Every player signal is recorded in a paper ledger. This process never
+places live orders and never uses private keys.
 
-POLYMARKET_API = "https://gamma-api.polymarket.com"
+Usage:
+    python main.py                 # Run continuously (scheduler)
+    python main.py --once          # One full scan and exit
+    python main.py --once --players-only
+    python main.py --once --market-only
+"""
 
-SYSTEM_PROMPT = """Tu es un chasseur d'inefficiences sur Polymarket.
+from __future__ import annotations
 
-On te donne un groupe de marchés liés au même thème. Ton travail :
+import argparse
+import asyncio
+import logging
+import signal
+import sys
 
-1. Cherche les asymétries de règles de résolution (temporelle, conditionnelle, différence de scope)
-2. Identifie si les prix impliquent une incohérence logique exploitable
-3. Calcule le ratio d'allocation optimal pour être profitable dans les 2 scénarios principaux
-4. Définis le signal de sortie anticipée PRÉCIS (pas "si ça monte" mais "si telle news sort" ou "si la donnée X dépasse Y")
-5. Identifie le scénario perdant et sa probabilité réelle
+import aiohttp
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
-Règles strictes :
-- Ne valide JAMAIS sans avoir expliqué pourquoi le marché a ce prix (le marché a peut-être raison)
-- Ignore si la seule différence est de la liquidité ou du bruit
-- Sois brutal : la plupart des groupes n'ont PAS d'opportunité réelle
+from alerts.analyzer import detect_big_moves, detect_gaps
+from alerts.telegram_bot import TelegramNotifier
+from config import Config
+from paper.ledger import PaperLedger
+from player_intel.client import DataAPIClient
+from player_intel.scanner import (
+    detect_leaderboard_anomalies,
+    detect_new_trades,
+    detect_position_changes,
+    max_trade_timestamp,
+)
+from player_intel.watchlist import load_watchlist
+from sources import kalshi, polymarket
+from sources.rss_monitor import fetch_all_feeds
+from state import BotState
 
-Réponds UNIQUEMENT en JSON :
-{
-  "score": <1-10>,
-    "opportunite": <true/false>,
-      "titre": "<titre court>",
-        "these": "<explication en 2 phrases>",
-          "position": {
-              "jambe1": {"marche": "<titre>", "direction": "YES/NO", "allocation_pct": <0-100>},
-                  "jambe2": {"marche": "<titre>", "direction": "YES/NO", "allocation_pct": <0-100>}
-                    },
-                      "scenarios": [
-                          {"nom": "...", "probabilite_pct": <int>, "pnl_pct": <int>, "gagnant": <bool>}
-                            ],
-                              "signal_sortie": "<signal précis>",
-                                "scenario_perdant": "<description>",
-                                  "probabilite_perdant_pct": <int>
-                                  }"""
+logging.basicConfig(
+    level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s │ %(levelname)-7s │ %(name)-25s │ %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("bot")
 
-# ─── POLYMARKET API ──────────────────────────────────────────────────────────
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
-def fetch_markets(limit=200):
-      """Fetch active markets with enough volume."""
-      try:
-                resp = requests.get(
-                              f"{POLYMARKET_API}/markets",
-                              params={"active": True, "closed": False, "limit": limit},
-                              timeout=15
-                )
-                resp.raise_for_status()
-                markets = resp.json()
-                filtered = [m for m in markets if float(m.get("volume", 0)) >= MIN_VOLUME]
-                print(f"[{now()}] Fetched {len(markets)} markets, {len(filtered)} above ${MIN_VOLUME} volume")
-                return filtered
-except Exception as e:
-        print(f"[{now()}] Error fetching markets: {e}")
-        return []
 
-def group_markets_by_theme(markets):
-      """Group markets that share keywords — these are candidates for arbitrage."""
-      from collections import defaultdict
+async def run_player_scan(
+    session: aiohttp.ClientSession,
+    state: BotState,
+    notifier: TelegramNotifier,
+    ledger: PaperLedger,
+) -> int:
+    """Scan watchlist wallets + leaderboard. Returns number of alerts sent."""
+    alerts_sent = 0
+    client = DataAPIClient(session=session, base_url=Config.POLYMARKET_DATA_API)
+    watchlist = load_watchlist(Config.POLYMARKET_WATCHLIST, Config.WATCHLIST_FILE)
+    logger.info("Player intel: %s watched wallet(s)", len(watchlist))
 
-    stopwords = {"the","a","an","in","on","at","to","of","will","by","for","be",
-                                  "is","or","and","as","it","its","with","from","that","this",
-                                  "le","la","les","de","du","des","un","une","par","pour","dans",
-                                  "est","sera","au","aux","en","et","ou","qui","que"}
+    board = await client.get_leaderboard(
+        time_period=Config.PLAYER_LEADERBOARD_PERIOD,
+        order_by="PNL",
+        limit=Config.PLAYER_LEADERBOARD_LIMIT,
+    )
+    logger.info(
+        "Leaderboard: %s traders (period=%s)",
+        len(board),
+        Config.PLAYER_LEADERBOARD_PERIOD,
+    )
+    previous_board = state.get_leaderboard()
+    if previous_board:
+        for signal in detect_leaderboard_anomalies(
+            previous_board, board, Config.PLAYER_LEADERBOARD_UNUSUAL_USD
+        ):
+            fill = ledger.record_signal(signal)
+            logger.info("LEADERBOARD: %s vol=$%.0f pnl=$%.0f", signal.label, signal.vol, signal.pnl)
+            await notifier.send_player_alert(signal, fill)
+            alerts_sent += 1
+    state.update_leaderboard(board)
 
-    def keywords(text):
-              words = text.lower().replace("?","").replace("-"," ").split()
-              return {w for w in words if len(w) > 3 and w not in stopwords}
+    for wallet in watchlist:
+        try:
+            snapshot = await client.get_wallet_snapshot(
+                wallet.address,
+                alias=wallet.alias,
+                position_limit=Config.PLAYER_POSITION_LIMIT,
+                trade_limit=Config.PLAYER_TRADE_LIMIT,
+            )
+        except Exception:
+            logger.exception("Failed to fetch snapshot for %s", wallet.address)
+            continue
 
-    index = defaultdict(list)
-    for m in markets:
-              title = m.get("question") or m.get("title") or ""
-              for kw in keywords(title):
-                            index[kw].append(m["id"])
-
-          # find pairs/triples sharing 2+ keywords
-          id_to_market = {m["id"]: m for m in markets}
-    groups = []
-    seen = set()
-
-    for kw, ids in index.items():
-              if len(ids) < 2:
-                            continue
-                        for pair in combinations(ids[:10], 2):
-                                      key = tuple(sorted(pair))
-                                      if key in seen:
-                                                        continue
-                                                    # check they share >= 2 keywords
-                                                    m1_kw = keywords(id_to_market[pair[0]].get("question",""))
-            m2_kw = keywords(id_to_market[pair[1]].get("question",""))
-            shared = m1_kw & m2_kw
-            if len(shared) >= 2:
-                              seen.add(key)
-                groups.append([id_to_market[pair[0]], id_to_market[pair[1]]])
-
-    print(f"[{now()}] Found {len(groups)} related pairs to analyze")
-    return groups
-
-# ─── CLAUDE ANALYSIS ─────────────────────────────────────────────────────────
-
-def analyze_group(group, client):
-      """Send a group of markets to Claude for analysis."""
-    market_summaries = []
-    for m in group:
-              title = m.get("question") or m.get("title") or "?"
-        outcomes = m.get("outcomes", [])
-        prices = m.get("outcomePrices", [])
-        volume = float(m.get("volume", 0))
-        end_date = m.get("endDate", m.get("endDateIso","?"))
-        rules = m.get("description", "")[:400]
-
-        price_str = ""
-        if outcomes and prices:
-                      price_str = " | ".join(f"{o}: {float(p)*100:.0f}c"
-                                                                                for o, p in zip(outcomes, prices))
-
-        market_summaries.append(
-                      f"MARCHE: {title}\n"
-                      f"Volume: ${volume:,.0f} | Expiration: {end_date}\n"
-                      f"Prix: {price_str}\n"
-                      f"Regles: {rules}\n"
+        value = snapshot.pnl.portfolio_value if snapshot.pnl else 0.0
+        logger.info(
+            "Wallet %s (%s): %s positions, value=$%.0f, unrealized=$%.0f",
+            wallet.label,
+            wallet.address[:10],
+            len(snapshot.positions),
+            value,
+            snapshot.pnl.unrealized_pnl if snapshot.pnl else 0.0,
         )
 
-    user_msg = "Analyse ce groupe de marchés liés :\n\n" + "\n---\n".join(market_summaries)
+        if not state.has_player_snapshot(wallet.address):
+            logger.info("Seeding player snapshot for %s (no alerts on first see)", wallet.label)
+            state.update_player_snapshot(
+                wallet.address,
+                snapshot.position_map,
+                max_trade_timestamp(snapshot.trades),
+                alias=wallet.alias,
+                value=value,
+            )
+            await asyncio.sleep(0.15)
+            continue
 
-    try:
-              response = client.messages.create(
-                            model="claude-sonnet-4-5",
-                            max_tokens=1000,
-                            system=SYSTEM_PROMPT,
-                            messages=[{"role": "user", "content": user_msg}]
-              )
-        raw = response.content[0].text.strip()
-        # strip possible ```json fences
-        raw = raw.replace("```json","").replace("```","").strip()
-        return json.loads(raw)
-except json.JSONDecodeError:
-        return None
-except Exception as e:
-        print(f"[{now()}] Claude error: {e}")
-        return None
+        previous = state.get_player_positions(wallet.address)
+        last_ts = state.get_last_trade_ts(wallet.address)
+        signals = detect_position_changes(
+            previous, snapshot, Config.PLAYER_NOTABLE_USD, alias=wallet.alias
+        )
+        signals.extend(
+            detect_new_trades(
+                snapshot,
+                last_ts,
+                Config.PLAYER_NOTABLE_USD,
+                signals,
+                alias=wallet.alias,
+            )
+        )
+        for signal in signals:
+            fill = ledger.record_signal(signal)
+            logger.info(
+                "PLAYER %s %s %s $%.0f",
+                signal.kind,
+                signal.label,
+                signal.title[:50],
+                signal.notional,
+            )
+            await notifier.send_player_alert(signal, fill)
+            alerts_sent += 1
 
-# ─── TELEGRAM ────────────────────────────────────────────────────────────────
+        state.update_player_snapshot(
+            wallet.address,
+            snapshot.position_map,
+            max(last_ts, max_trade_timestamp(snapshot.trades)),
+            alias=wallet.alias,
+            value=value,
+        )
+        await asyncio.sleep(0.15)
 
-def send_telegram(result, group):
-      if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-                print(f"[{now()}] (Telegram non configure) Opportunite: {result['titre']}")
-        return
+    return alerts_sent
 
-    j1 = result["position"]["jambe1"]
-    j2 = result["position"]["jambe2"]
-    scenarios_str = "\n".join(
-              f"  {'V' if s['gagnant'] else 'X'} {s['nom']} ({s['probabilite_pct']}%) -> {'+' if s['pnl_pct']>=0 else ''}{s['pnl_pct']}%"
-              for s in result.get("scenarios", [])
+
+async def run_market_scan(
+    session: aiohttp.ClientSession,
+    state: BotState,
+    notifier: TelegramNotifier,
+) -> tuple[int, int]:
+    """Gap / big-move / RSS cycle. Returns (alerts_sent, market_count)."""
+    alerts_sent = 0
+
+    logger.info("Fetching Polymarket...")
+    poly_events = await polymarket.fetch_active_markets(session)
+
+    logger.info("Fetching Kalshi...")
+    kalshi_markets = await kalshi.fetch_active_markets(session)
+
+    logger.info(
+        "Got %s Polymarket events, %s Kalshi markets",
+        len(poly_events),
+        len(kalshi_markets),
     )
 
-    text = (
-              f"Opportunite Polymarket - Score {result['score']}/10\n\n"
-              f"{result['titre']}\n\n"
-              f"{result['these']}\n\n"
-              f"Position :\n"
-              f"- Jambe 1: {j1['direction']} {j1['marche'][:50]} -> {j1['allocation_pct']}%\n"
-              f"- Jambe 2: {j2['direction']} {j2['marche'][:50]} -> {j2['allocation_pct']}%\n\n"
-              f"Scenarios :\n{scenarios_str}\n\n"
-              f"Signal de sortie : {result['signal_sortie']}\n\n"
-              f"Scenario perdant ({result['probabilite_perdant_pct']}%) : {result['scenario_perdant']}"
+    gap_alerts = detect_gaps(poly_events, kalshi_markets)
+    for alert in gap_alerts[:5]:
+        logger.info("GAP: %s — %s bps", alert.market_name, alert.gap_bps)
+        await notifier.send_gap_alert(alert)
+        alerts_sent += 1
+
+    current_prices = {}
+    current_info = {}
+
+    for pe in poly_events:
+        price = polymarket.get_yes_price(pe)
+        if price is not None:
+            key = f"poly_{pe.id}"
+            current_prices[key] = price
+            current_info[key] = {
+                "title": pe.title,
+                "category": pe.category,
+                "source": "Polymarket",
+                "url": pe.url,
+            }
+
+    for km in kalshi_markets:
+        key = f"kalshi_{km.id}"
+        current_prices[key] = km.yes_price
+        current_info[key] = {
+            "title": km.title,
+            "category": km.category,
+            "source": "Kalshi",
+            "url": km.url,
+        }
+
+    move_alerts = detect_big_moves(
+        current_prices,
+        state.previous_prices,
+        {**state.market_info, **current_info},
     )
+    for alert in move_alerts[:5]:
+        logger.info("MOVE: %s — %s bps", alert.market_name, alert.delta_bps)
+        await notifier.send_big_move_alert(alert)
+        alerts_sent += 1
+
+    state.update_prices(current_prices, current_info)
+
+    logger.info("Checking RSS feeds...")
+    last_run = state.get_last_run()
+    rss_items = await fetch_all_feeds(session, since=last_run)
+
+    rss_sent = 0
+    for item in rss_items:
+        if state.is_rss_seen(item.guid):
+            continue
+        if rss_sent >= 3:
+            break
+        logger.info("RSS: [%s] %s", item.feed_name, item.title)
+        await notifier.send_rss_alert(item)
+        state.mark_rss_seen(item.guid)
+        alerts_sent += 1
+        rss_sent += 1
+
+    return alerts_sent, len(current_prices)
+
+
+async def run_scan(
+    state: BotState,
+    notifier: TelegramNotifier,
+    ledger: PaperLedger,
+    *,
+    run_markets: bool = True,
+    run_players: bool = True,
+) -> None:
+    """Execute one full scan cycle."""
+    logger.info("═══ Scan #%s starting ═══", state.run_count + 1)
+    alerts_sent = 0
+    market_count = len(state.previous_prices)
+    watchlist = load_watchlist(Config.POLYMARKET_WATCHLIST, Config.WATCHLIST_FILE)
 
     try:
-              requests.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-                            timeout=10
-              )
-        print(f"[{now()}] Telegram alert sent: {result['titre']}")
-except Exception as e:
-        print(f"[{now()}] Telegram error: {e}")
+        async with aiohttp.ClientSession() as session:
+            if run_players and Config.ENABLE_PLAYER_INTEL:
+                alerts_sent += await run_player_scan(session, state, notifier, ledger)
 
-# ─── MAIN LOOP ───────────────────────────────────────────────────────────────
+            if run_markets and Config.ENABLE_MARKET_INTEL:
+                market_alerts, market_count = await run_market_scan(session, state, notifier)
+                alerts_sent += market_alerts
 
-def now():
-      return datetime.now().strftime("%H:%M:%S")
+            if state.should_heartbeat():
+                feed_count = sum(len(feeds) for feeds in Config.RSS_FEEDS.values())
+                summary = ledger.summary()
+                await notifier.send_heartbeat(
+                    market_count=market_count,
+                    feed_count=feed_count,
+                    watchlist_count=len(watchlist),
+                    paper_fills=summary["fills"],
+                    paper_open_notional=summary["open_notional"],
+                )
 
-def run_scan(client):
-      print(f"\n[{now()}] Starting scan")
-    markets = fetch_markets()
-    if not markets:
-              return
+            state.mark_run()
+            state.save()
 
-    groups = group_markets_by_theme(markets)
-    opportunities = []
+            if alerts_sent == 0:
+                logger.info("No significant alerts this cycle.")
+            else:
+                logger.info("Sent %s alerts this cycle. Paper: %s", alerts_sent, ledger.summary())
 
-    for i, group in enumerate(groups):
-              result = analyze_group(group, client)
-        if not result:
-                      continue
+    except Exception as e:
+        logger.exception("Scan error: %s", e)
+        try:
+            await notifier.send_error(str(e))
+        except Exception:
+            pass
 
-        score = result.get("score", 0)
-        if result.get("opportunite") and score >= MIN_OPPORTUNITY_SCORE:
-                      print(f"[{now()}] Score {score}/10 - {result.get('titre','?')}")
-            send_telegram(result, group)
-            opportunities.append(result)
-else:
-            pass  # silent skip
 
-        # avoid hitting rate limits
-        if (i+1) % 10 == 0:
-                      time.sleep(2)
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Market intel + Polymarket player tracker (paper only)")
+    parser.add_argument("--once", action="store_true", help="Run a single scan and exit")
+    parser.add_argument("--players-only", action="store_true", help="Skip gap/RSS market intel")
+    parser.add_argument("--market-only", action="store_true", help="Skip player intel")
+    return parser.parse_args(argv)
 
-    print(f"[{now()}] Scan done. {len(opportunities)} opportunities found out of {len(groups)} pairs.")
-    return opportunities
 
-def main():
-      if not ANTHROPIC_API_KEY:
-                print("ERROR: Set ANTHROPIC_API_KEY environment variable")
+async def async_main(argv: list[str]) -> None:
+    args = parse_args(argv)
+    run_markets = not args.players_only
+    run_players = not args.market_only
+
+    state = BotState()
+    notifier = TelegramNotifier()
+    ledger = PaperLedger(
+        Config.PAPER_LEDGER_FILE,
+        max_usd=Config.PAPER_MAX_USD,
+        copy_ratio=Config.PAPER_COPY_RATIO,
+    )
+    watchlist = load_watchlist(Config.POLYMARKET_WATCHLIST, Config.WATCHLIST_FILE)
+
+    logger.info("Bot starting up (paper player tracking, no live orders)")
+    logger.info("State file: %s", state.state_file)
+    logger.info("Paper ledger: %s", ledger.path)
+    logger.info("Watchlist: %s wallet(s)", len(watchlist))
+    await notifier.send_startup(watchlist_count=len(watchlist))
+
+    if args.once:
+        await run_scan(
+            state, notifier, ledger, run_markets=run_markets, run_players=run_players
+        )
         return
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    print("Polymarket Arbitrage Scanner started")
-    print(f"Scan interval: every {SCAN_INTERVAL_H}h | Min volume: ${MIN_VOLUME} | Min score: {MIN_OPPORTUNITY_SCORE}/10")
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        run_scan,
+        trigger=IntervalTrigger(minutes=Config.CHECK_INTERVAL_MINUTES),
+        kwargs={
+            "state": state,
+            "notifier": notifier,
+            "ledger": ledger,
+            "run_markets": run_markets,
+            "run_players": run_players,
+        },
+        id="market_scan",
+        name="Market Intelligence Scan",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+    scheduler.start()
 
-    while True:
-              run_scan(client)
-        print(f"[{now()}] Next scan in {SCAN_INTERVAL_H}h...")
-        time.sleep(SCAN_INTERVAL_H * 3600)
+    await run_scan(
+        state, notifier, ledger, run_markets=run_markets, run_players=run_players
+    )
+
+    logger.info("Scheduler active — next scan in %s min", Config.CHECK_INTERVAL_MINUTES)
+    stop_event = asyncio.Event()
+
+    def handle_signal(sig, frame):
+        logger.info("Received signal %s, shutting down...", sig)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    await stop_event.wait()
+    scheduler.shutdown(wait=False)
+    logger.info("Bot stopped.")
+
+
+def main() -> None:
+    asyncio.run(async_main(sys.argv[1:]))
+
 
 if __name__ == "__main__":
-      main()
+    main()
